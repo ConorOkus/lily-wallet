@@ -1,14 +1,13 @@
+const { Worker } = require('worker_threads');
 const axios = require('axios');
 const moment = require('moment');
 const { app, BrowserWindow, ipcMain, remote, dialog } = require('electron');
 const { networks } = require('bitcoinjs-lib');
 const BigNumber = require('bignumber.js');
-const { download } = require('electron-dl');
 const Client = require('bitcoin-core');
 
 const { enumerate, getXPub, signtx, promptpin, sendpin } = require('./server/commands');
 const { getRpcInfo } = require('./server/utils')
-const { getDataFromMultisig, getDataFromXPub, getMultisigDescriptor, getAddressFromAccount } = require('./utils/transactions');
 
 const path = require('path');
 const fs = require('fs');
@@ -212,85 +211,22 @@ app.on('activate', function () {
 
 ipcMain.on('/account-data', async (event, args) => {
   const { config } = args;
-  let addresses, changeAddresses, transactions, unusedAddresses, unusedChangeAddresses, availableUtxos;
-  let nodeClient = undefined;
-  try {
-    if (currentNodeConfig.provider !== 'Blockstream') {
-      const nodeClient = new Client({
-        wallet: config.name,
-        host: currentNodeConfig.host || 'http://localhost:8332',
-        username: currentNodeConfig.rpcuser || currentNodeConfig.username, // TODO: uniform this in the future
-        password: currentNodeConfig.rpcpassword || currentNodeConfig.password,
-        version: '0.20.1'
-      });
+  console.log('hits /account-data');
 
-      const walletList = await nodeClient.listWallets();
-
-      if (!walletList.includes(config.name)) {
-        try {
-          const walletResp = await nodeClient.loadWallet({ filename: config.name });
-        } catch (e) { // if failed to load wallet, then probably doesnt exist so let's create one and import
-          await nodeClient.createWallet({ wallet_name: config.name });
-          if (config.quorum.totalSigners === 1) {
-            const ADDRESS_IMPORT_NUM = 500;
-            for (let i = 0; i < ADDRESS_IMPORT_NUM; i++) {
-              const receiveAddress = getAddressFromAccount(config, `m/0/${i}`, currentBitcoinNetwork)
-              const changeAddress = getAddressFromAccount(config, `m/1/${i}`, currentBitcoinNetwork)
-
-              await nodeClient.importAddress({
-                address: receiveAddress.address,
-                rescan: false
-              });
-
-              await nodeClient.importAddress({
-                address: changeAddress.address,
-                rescan: false
-              });
-
-            }
-
-          } else { // multisig
-            //  import receive addresses
-            await nodeClient.importMulti({
-              desc: getMultisigDescriptor(nodeClient, config.quorum.requiredSigners, config.extendedPublicKeys, true),
-              // range: '[0, 1000]'
-            });
-
-            // import change
-            await nodeClient.importMulti({
-              desc: getMultisigDescriptor(nodeClient, config.quorum.requiredSigners, config.extendedPublicKeys, false),
-              // range: '[0, 1000]'
-            });
-          }
-        }
-      }
-    }
-
-    if (config.quorum.totalSigners > 1) {
-      [addresses, changeAddresses, transactions, unusedAddresses, unusedChangeAddresses, availableUtxos] = await getDataFromMultisig(config, nodeClient, currentBitcoinNetwork);
-    } else {
-      [addresses, changeAddresses, transactions, unusedAddresses, unusedChangeAddresses, availableUtxos] = await getDataFromXPub(config, nodeClient, currentBitcoinNetwork);
-    }
-
-    const currentBalance = availableUtxos.reduce((accum, utxo) => accum.plus(utxo.value), BigNumber(0));
-
-    const accountData = {
-      name: config.name,
-      config: config,
-      addresses,
-      changeAddresses,
-      availableUtxos,
-      transactions,
-      unusedAddresses,
-      currentBalance: currentBalance.toNumber(),
-      unusedChangeAddresses
-    };
-
-    event.reply('/account-data', accountData);
-
-  } catch (e) {
-    console.log('e: ', e);
+  process.dlopen = () => {
+    throw new Error('Load native module is not safe')
   }
+
+  const worker = new Worker('./src/server/transactionWorker.js');
+  console.log('create worker');
+
+  worker.postMessage({ config, currentNodeConfig, currentBitcoinNetwork });
+  console.log('after postMessage');
+
+  worker.on("message", (accountData) => {
+    console.log(accountData);
+    event.reply('/account-data', accountData);
+  })
 });
 
 ipcMain.handle('/get-config', async (event, args) => {
@@ -405,19 +341,17 @@ ipcMain.handle('/estimateFee', async (event, args) => {
         halfHourFee: undefined,
         hourFee: undefined
       }
-      const fastestFeeRate = await nodeClient.estimateSmartFee(1).feerate;
-      feeRates.fastestFee = BigNumber(fastestFeeRate).multipliedBy(100000).integerValue(BigNumber.ROUND_CEIL).toNumber(); // TODO: this probably needs relooked at
-      const halfHourFeeRate = await nodeClient.estimateSmartFee(3).feerate;
-      feeRates.halfHourFee = BigNumber(halfHourFeeRate).multipliedBy(100000).integerValue(BigNumber.ROUND_CEIL).toNumber(); // TODO: this probably needs relooked at
-      const hourFeeRate = await nodeClient.estimateSmartFee(6).feerate;
-      feeRates.hourFee = BigNumber(hourFeeRate).multipliedBy(100000).integerValue(BigNumber.ROUND_CEIL).toNumber(); // TODO: this probably needs relooked at
-
+      const fastestFeeRate = await nodeClient.estimateSmartFee(1);
+      feeRates.fastestFee = BigNumber(fastestFeeRate.feerate).multipliedBy(100000).integerValue(BigNumber.ROUND_CEIL).toNumber(); // TODO: this probably needs relooked at
+      const halfHourFeeRate = await nodeClient.estimateSmartFee(3);
+      feeRates.halfHourFee = BigNumber(halfHourFeeRate.feerate).multipliedBy(100000).integerValue(BigNumber.ROUND_CEIL).toNumber(); // TODO: this probably needs relooked at
+      const hourFeeRate = await nodeClient.estimateSmartFee(6);
+      feeRates.hourFee = BigNumber(hourFeeRate.feerate).multipliedBy(100000).integerValue(BigNumber.ROUND_CEIL).toNumber(); // TODO: this probably needs relooked at
       return Promise.resolve(feeRates);
     } catch (e) {
       return Promise.reject(new Error('Error retrieving fee'));
     }
   }
-
 });
 
 ipcMain.handle('/broadcastTx', async (event, args) => {
